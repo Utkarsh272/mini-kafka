@@ -1,0 +1,149 @@
+version: "3.9"
+
+# 3-broker mini-kafka cluster + Prometheus + Grafana
+# Each broker gets its own persistent volume and data directory.
+#
+# Broker layout:
+#   broker-1  nodeID=1  port=9092  (primary for partition 0)
+#   broker-2  nodeID=2  port=9093  (primary for partition 1)
+#   broker-3  nodeID=3  port=9094  (primary for partition 2)
+#
+# All brokers share the same Docker network so they can reach each other
+# by service name (broker-1, broker-2, broker-3).
+
+networks:
+  kafka-net:
+    driver: bridge
+
+volumes:
+  broker1-data:
+  broker2-data:
+  broker3-data:
+  prometheus-data:
+  grafana-data:
+
+services:
+
+  # ── Broker 1 ──────────────────────────────────────────────────────────────
+  broker-1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mini-kafka:latest
+    container_name: mini-kafka-broker-1
+    command:
+      - "--addr=:9092"
+      - "--data-dir=/data"
+      - "--node-id=1"
+      - "--host=broker-1"
+      - "--port=9092"
+    ports:
+      - "9092:9092"
+    volumes:
+      - broker1-data:/data
+    networks:
+      - kafka-net
+    environment:
+      - LOG_LEVEL=info
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "9092"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  # ── Broker 2 ──────────────────────────────────────────────────────────────
+  broker-2:
+    image: mini-kafka:latest
+    container_name: mini-kafka-broker-2
+    command:
+      - "--addr=:9093"
+      - "--data-dir=/data"
+      - "--node-id=2"
+      - "--host=broker-2"
+      - "--port=9093"
+    ports:
+      - "9093:9093"
+    volumes:
+      - broker2-data:/data
+    networks:
+      - kafka-net
+    environment:
+      - LOG_LEVEL=info
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "9093"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+    depends_on:
+      broker-1:
+        condition: service_healthy
+
+  # ── Broker 3 ──────────────────────────────────────────────────────────────
+  broker-3:
+    image: mini-kafka:latest
+    container_name: mini-kafka-broker-3
+    command:
+      - "--addr=:9094"
+      - "--data-dir=/data"
+      - "--node-id=3"
+      - "--host=broker-3"
+      - "--port=9094"
+    ports:
+      - "9094:9094"
+    volumes:
+      - broker3-data:/data
+    networks:
+      - kafka-net
+    environment:
+      - LOG_LEVEL=info
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "9094"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+    depends_on:
+      broker-2:
+        condition: service_healthy
+
+  # ── Prometheus ────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: mini-kafka-prometheus
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+    ports:
+      - "9090:9090"
+    networks:
+      - kafka-net
+    restart: unless-stopped
+
+  # ── Grafana ───────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: mini-kafka-grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    networks:
+      - kafka-net
+    restart: unless-stopped
+    depends_on:
+      - prometheus
