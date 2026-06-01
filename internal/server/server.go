@@ -7,13 +7,16 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/Utkarsh272/mini-kafka/internal/broker"
 	"github.com/Utkarsh272/mini-kafka/internal/consumer_group"
+	"github.com/Utkarsh272/mini-kafka/internal/metrics"
 	"github.com/Utkarsh272/mini-kafka/internal/protocol"
 	"github.com/Utkarsh272/mini-kafka/internal/replication"
 )
 
+// Handler dispatches incoming requests to the right broker operation.
 type Handler struct {
 	broker *broker.Broker
 }
@@ -22,7 +25,18 @@ func NewHandler(b *broker.Broker) *Handler {
 	return &Handler{broker: b}
 }
 
+// Handle dispatches a single request, recording Prometheus metrics.
 func (h *Handler) Handle(w io.Writer, hdr protocol.RequestHeader, payload []byte) {
+	start := time.Now()
+	apiName := metrics.APIKeyName(uint8(hdr.APIKey))
+	result := "ok"
+
+	defer func() {
+		ms := float64(time.Since(start).Microseconds()) / 1000.0
+		metrics.RequestsTotal.WithLabelValues(apiName, result).Inc()
+		metrics.RequestDurationMs.WithLabelValues(apiName).Observe(ms)
+	}()
+
 	switch hdr.APIKey {
 	case protocol.APIKeyProduce:
 		h.handleProduce(w, hdr, payload)
@@ -49,6 +63,7 @@ func (h *Handler) Handle(w io.Writer, hdr protocol.RequestHeader, payload []byte
 	case protocol.APIKeyDescribeGroup:
 		h.handleDescribeGroup(w, hdr, payload)
 	default:
+		result = "error"
 		slog.Warn("unknown api_key", "api_key", hdr.APIKey, "client", hdr.ClientID)
 		protocol.WriteResponse(w, hdr.CorrelationID, protocol.ErrUnknown, nil)
 	}
@@ -98,6 +113,15 @@ func (h *Handler) handleProduce(w io.Writer, hdr protocol.RequestHeader, payload
 						}
 						continue
 					}
+					// Record metrics per successful append.
+					partLabel := fmt.Sprintf("%d", partID)
+					metrics.MessagesProducedTotal.WithLabelValues(t.Topic, partLabel).Inc()
+					metrics.BytesProducedTotal.WithLabelValues(t.Topic).Add(float64(len(rec.Value)))
+					metrics.PartitionLogEndOffset.WithLabelValues(t.Topic, partLabel).Set(float64(off + 1))
+					hwm := part.HighWatermark()
+					metrics.PartitionHighWatermark.WithLabelValues(t.Topic, partLabel).Set(float64(hwm))
+					metrics.PartitionReplicationLag.WithLabelValues(t.Topic, partLabel).Set(float64(off + 1 - hwm))
+
 					if _, seen := routedResults[partID]; !seen {
 						routedResults[partID] = &protocol.ProducePartitionResult{
 							PartitionID: partID, ErrorCode: protocol.ErrNone, BaseOffset: off,
@@ -127,6 +151,13 @@ func (h *Handler) handleProduce(w io.Writer, hdr protocol.RequestHeader, payload
 					if i == 0 {
 						baseOffset = off
 					}
+					partLabel := fmt.Sprintf("%d", targetPartID)
+					metrics.MessagesProducedTotal.WithLabelValues(t.Topic, partLabel).Inc()
+					metrics.BytesProducedTotal.WithLabelValues(t.Topic).Add(float64(len(rec.Value)))
+					metrics.PartitionLogEndOffset.WithLabelValues(t.Topic, partLabel).Set(float64(off + 1))
+					hwm := part.HighWatermark()
+					metrics.PartitionHighWatermark.WithLabelValues(t.Topic, partLabel).Set(float64(hwm))
+					metrics.PartitionReplicationLag.WithLabelValues(t.Topic, partLabel).Set(float64(off + 1 - hwm))
 				}
 				tr.Partitions = append(tr.Partitions, protocol.ProducePartitionResult{
 					PartitionID: targetPartID, ErrorCode: errCode, BaseOffset: baseOffset,
@@ -179,6 +210,9 @@ func (h *Handler) handleFetch(w io.Writer, hdr protocol.RequestHeader, payload [
 				})
 				continue
 			}
+			partLabel := fmt.Sprintf("%d", fp.PartitionID)
+			metrics.MessagesFetchedTotal.WithLabelValues(t.Topic, partLabel).Add(float64(len(records)))
+
 			var fetchRecords []protocol.FetchRecord
 			for _, r := range records {
 				fetchRecords = append(fetchRecords, protocol.FetchRecord{
@@ -197,12 +231,8 @@ func (h *Handler) handleFetch(w io.Writer, hdr protocol.RequestHeader, payload [
 		protocol.EncodeFetchResponse(topicResults))
 }
 
-// ---- FetchFollower (API key 8) ---------------------------------------------
+// ---- FetchFollower ---------------------------------------------------------
 
-// handleFetchFollower serves replication fetch requests from follower brokers.
-// Returns records starting at the follower's current LEO plus the leader's LEO.
-// ISR tracking via follower nodeID is a Day 13 (multi-broker) concern — the
-// FetchFollower request payload does not yet carry a nodeID field.
 func (h *Handler) handleFetchFollower(w io.Writer, hdr protocol.RequestHeader, payload []byte) {
 	req, err := replication.DecodeFetchFollowerRequest(payload)
 	if err != nil {
@@ -242,9 +272,7 @@ func (h *Handler) handleFetchFollower(w io.Writer, hdr protocol.RequestHeader, p
 
 	w.Write(replication.EncodeFetchFollowerResponse(hdr.CorrelationID,
 		replication.FetchFollowerResponse{
-			ErrorCode: 0,
-			LeaderLEO: part.LogEndOffset(),
-			Records:   fetchRecords,
+			ErrorCode: 0, LeaderLEO: part.LogEndOffset(), Records: fetchRecords,
 		}))
 }
 
@@ -257,11 +285,9 @@ func (h *Handler) handleMetadata(w io.Writer, hdr protocol.RequestHeader, payloa
 		protocol.WriteResponse(w, hdr.CorrelationID, protocol.ErrInvalidRequest, nil)
 		return
 	}
-
 	brokerList := []protocol.BrokerInfo{{
 		NodeID: h.broker.NodeID(), Host: h.broker.Host(), Port: h.broker.Port(),
 	}}
-
 	allTopics := h.broker.ListTopics()
 	var topicsToDescribe []string
 	if len(req.Topics) == 0 {
@@ -271,12 +297,10 @@ func (h *Handler) handleMetadata(w io.Writer, hdr protocol.RequestHeader, payloa
 	} else {
 		topicsToDescribe = req.Topics
 	}
-
 	topicMap := make(map[string]*broker.Topic, len(allTopics))
 	for _, t := range allTopics {
 		topicMap[t.Name()] = t
 	}
-
 	var topicMeta []protocol.TopicMetadata
 	for _, name := range topicsToDescribe {
 		t, ok := topicMap[name]
@@ -295,7 +319,6 @@ func (h *Handler) handleMetadata(w io.Writer, hdr protocol.RequestHeader, payloa
 		}
 		topicMeta = append(topicMeta, tm)
 	}
-
 	protocol.WriteResponse(w, hdr.CorrelationID, protocol.ErrNone,
 		protocol.EncodeMetadataResponse(brokerList, topicMeta))
 }
@@ -401,6 +424,7 @@ func (h *Handler) handleOffsetCommit(w io.Writer, hdr protocol.RequestHeader, pa
 				continue
 			}
 			part.CommitOffset(req.GroupID, p.Offset)
+			metrics.OffsetCommitsTotal.WithLabelValues(req.GroupID).Inc()
 			tr.Partitions = append(tr.Partitions, protocol.OffsetCommitPartitionResult{
 				PartitionID: p.PartitionID, ErrorCode: protocol.ErrNone,
 			})
@@ -537,8 +561,10 @@ func (s *Server) ListenAndServe() error {
 			return nil
 		}
 		s.wg.Add(1)
+		metrics.ActiveConnections.Inc()
 		go func(c net.Conn) {
 			defer s.wg.Done()
+			defer metrics.ActiveConnections.Dec()
 			s.serveConn(c)
 		}(conn)
 	}

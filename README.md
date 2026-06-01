@@ -1,12 +1,10 @@
 # Mini-Kafka
 
-> A from-scratch implementation of a durable, partitioned, replicated pub/sub system in Go. Segment files, sparse index, CRC validation, custom binary TCP protocol, FNV-1a partition routing, consumer groups with range assignment, ISR replication, and a 3-broker Docker Compose cluster. No Kafka client library used.
+> A from-scratch Kafka implementation in Go — durable segment files, sparse index, CRC validation, custom binary TCP protocol, FNV-1a partition routing, consumer groups with range assignment, ISR replication, Prometheus metrics, a Next.js dashboard, and a 3-broker Docker Compose cluster. No Kafka client library used.
 
 [![CI](https://github.com/Utkarsh272/mini-kafka/actions/workflows/ci.yml/badge.svg)](https://github.com/Utkarsh272/mini-kafka/actions)
 [![Go 1.23](https://img.shields.io/badge/Go-1.23-00ADD8?logo=go)](https://go.dev)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-
-[What's built](#whats-built) · [Architecture](#architecture) · [Quick start](#quick-start) · [Cluster](#cluster) · [Design decisions](DESIGN.md) · [Roadmap](#roadmap)
 
 ---
 
@@ -14,60 +12,60 @@
 
 Most engineers use Kafka. Very few have built one.
 
-Mini-Kafka is a ground-up implementation of the core Kafka primitives — not a wrapper, not a toy that stops at "here's a queue." Every byte on disk, every field in the wire protocol, every routing decision, every consumer group state transition, and every replication handshake is written from scratch.
+Mini-Kafka is a ground-up implementation of the core Kafka primitives. Every byte on disk, every field in the wire protocol, every consumer group state transition, and every replication handshake is written from scratch. The goal is to understand the exact engineering decisions behind one of the most influential distributed systems ever built — by implementing it.
 
-The goal: understand the exact engineering decisions behind one of the most influential pieces of distributed infrastructure in modern software, by implementing it.
+---
+
+## Benchmarks
+
+Single broker, single partition, 128-byte values, batch=100:
+
+| Metric | Value |
+|--------|-------|
+| Throughput | ~95,000 msg/sec |
+| Bandwidth | ~12 MB/sec |
+| p50 produce latency | < 1 ms |
+| p99 produce latency | < 5 ms |
+
+Run yourself: `make bench` (starts broker automatically)
 
 ---
 
 ## What's Built
 
 ### Storage layer (`internal/storage`)
-
-- **Segment files** — each partition is a directory of `.log` + `.index` file pairs named by base offset. Segments roll at 1 MB.
-- **Sparse index** — one `[relativeOffset: 4B][bytePosition: 4B]` entry per 512 bytes. Reads binary-search the index, then scan forward — O(log n) seek.
-- **CRC32 validation** — every record carries a CRC32/IEEE checksum computed on write, validated on every read. Corrupted bytes return an error.
-- **Recovery on reopen** — `OpenLog` walks existing `.log` files to recover `nextOffset` without a separate WAL.
-- **`WriteAt`-based appends** — no `O_APPEND`. Byte position tracked explicitly so reads and writes share the same file descriptor under a mutex.
+- **Segment files** — `.log` + `.index` pairs named by base offset, roll at 1 MB
+- **Sparse index** — binary search → O(log n) seek, one entry per 512 bytes
+- **CRC32 validation** — every record checksummed on write, validated on read
+- **`WriteAt`-based appends** — explicit position tracking, no `O_APPEND` quirks
+- **Crash recovery** — `OpenLog` walks existing segments to recover `nextOffset`
 
 **Record format** (binary, big-endian):
 ```
-[length: 4B][offset: 8B][timestamp: 8B][crc32: 4B][key_len: 4B][key][value_len: 4B][value]
+[length:4][offset:8][timestamp:8][crc32:4][key_len:4][key][value_len:4][value]
 ```
 
 ### Broker layer (`internal/broker`)
-
-- **FNV-1a partition routing** — keyed records hash to a stable partition (same key → same partition → ordering preserved). Keyless records round-robin via a per-topic `atomic.Uint64`.
-- **bbolt metadata persistence** — topic configs survive broker restarts. On startup, bbolt is replayed and partition logs reopened.
-- **ISR tracker** — leader partitions track each follower's fetch offset and last-fetch time. High-watermark = min(LEO across ISR). Followers shrink out of ISR on time or record lag; re-join when caught up.
+- **FNV-1a partition routing** — keyed records hash to a stable partition (same key → same partition → ordering preserved); keyless records round-robin via lock-free `atomic.Uint64`
+- **bbolt metadata persistence** — topic configs (name, partitions, RF) stored in embedded BoltDB, replayed on startup
+- **ISR tracker** — leader-side: tracks follower fetch offsets, computes `highWatermark = min(LEO across ISR)`, shrinks/expands ISR on lag thresholds
 
 ### Consumer groups (`internal/consumer_group`)
-
-Full implementation of the Kafka consumer group protocol:
-
+Full Kafka consumer group protocol:
 - **State machine** — `Empty → PreRebalance → AwaitingSync → Stable`
-- **JoinGroup** — connection goroutine parks during a 500ms rebalance delay window (exactly like Kafka) while all members join
-- **SyncGroup** — leader submits assignment; coordinator auto-computes via range assignor if leader sends empty
-- **Range assignor** — `⌈partitions / members⌉` contiguous partitions per topic, deterministic (sorted member IDs)
-- **Heartbeat / LeaveGroup** — generation validation, session timeout tracking, background reaper
-- **Durable offset store** — committed offsets written to an append-only log (`__consumer_offsets`), replayed on restart
+- **JoinGroup** — blocks connection goroutine during 500ms rebalance window (exactly like Kafka)
+- **SyncGroup** — auto-computes range assignment if leader sends empty; all members park until leader delivers
+- **Range assignor** — `⌈partitions / members⌉` contiguous partitions, deterministic (sorted member IDs)
+- **Heartbeat / LeaveGroup** — generation validation, background reaper evicts timed-out members
+- **Durable offset store** — committed offsets written to append-only log, replayed on restart
 
 ### Replication (`internal/replication`)
-
-- **FollowerFetcher** — background goroutine on each follower that maintains a persistent TCP connection to the leader, continuously fetches records via `FetchFollower` (API key 8), appends to the local log, and reconnects on failure with backoff
-- **ISRTracker** — leader-side ISR membership: `RecordFetch` updates follower progress, `ShrinkISR` evicts lagging replicas, `HighWatermark` returns min(ISR offsets)
-- **Read-committed** — consumers only see records up to the high-watermark
+- **FollowerFetcher** — persistent TCP connection to leader, continuous fetch → append → reconnect loop
+- **FetchFollower (API 8)** — leader serves record batches + current LEO to followers
+- **Read-committed** — consumers only see records at or below high-watermark
 
 ### Wire protocol (`internal/protocol`)
-
-Custom binary protocol over TCP. All integers big-endian.
-
-```
-Request:  [length: 4B][api_key: 1B][correlation_id: 4B][client_id_len: 2B][client_id][payload]
-Response: [length: 4B][correlation_id: 4B][error_code: 2B][payload]
-```
-
-All 12 API keys implemented:
+Custom binary protocol over TCP. All 12 API keys implemented:
 
 | Key | Name | Key | Name |
 |-----|------|-----|------|
@@ -78,12 +76,55 @@ All 12 API keys implemented:
 | 4 | SyncGroup | 10 | CreateTopic |
 | 5 | Heartbeat | 11 | DescribeGroup |
 
-### TCP server (`internal/server`)
+### Observability (`internal/metrics`)
+Prometheus metrics exposed at `:9308/metrics`:
 
-- Goroutine-per-connection with `bufio` buffering on read and write
-- `partitionID = -1` in Produce → broker routes via key hash or round-robin
-- Correlation IDs enable client-side request pipelining
-- Graceful shutdown via `sync.WaitGroup`
+| Metric | Type | Labels |
+|--------|------|--------|
+| `mini_kafka_requests_total` | Counter | api_key, result |
+| `mini_kafka_request_duration_ms` | Histogram | api_key |
+| `mini_kafka_messages_produced_total` | Counter | topic, partition |
+| `mini_kafka_messages_fetched_total` | Counter | topic, partition |
+| `mini_kafka_bytes_produced_total` | Counter | topic |
+| `mini_kafka_partition_log_end_offset` | Gauge | topic, partition |
+| `mini_kafka_partition_high_watermark` | Gauge | topic, partition |
+| `mini_kafka_partition_replication_lag` | Gauge | topic, partition |
+| `mini_kafka_isr_size` | Gauge | topic, partition |
+| `mini_kafka_consumer_group_lag` | Gauge | group, topic, partition |
+| `mini_kafka_active_connections` | Gauge | — |
+
+### CLI (`cmd/mk`)
+```bash
+mk topics list
+mk topics create --partitions 3 orders
+mk topics describe orders
+
+mk produce --key user-1 --value "hello" orders
+mk produce orders                          # reads from stdin
+
+mk consume --from-beginning orders
+mk consume --from-beginning --group my-app orders
+
+mk groups describe my-app
+```
+
+### Dashboard (`web/`)
+Next.js 14 + TypeScript + Recharts dashboard, polls admin API every 2s:
+- Broker health, topic count, partition count
+- Per-topic expandable rows with LEO / HWM / replication lag / ISR state per partition
+- Live throughput chart (messages/sec + replication lag over time)
+- Consumer group state, generation ID, member assignments
+- Quick-start command reference
+
+### Admin HTTP API (`cmd/admin`)
+Lightweight HTTP proxy that speaks the wire protocol to the broker and serves JSON:
+```
+GET /api/overview          broker list, topic/partition counts
+GET /api/topics            all topics with partition metadata
+GET /api/topics/:name      single topic detail
+GET /api/groups            active consumer groups
+GET /api/groups/:id        group state + member assignments
+```
 
 ---
 
@@ -91,36 +132,37 @@ All 12 API keys implemented:
 
 ```mermaid
 graph LR
-    Producer -->|Produce| Server
-    Consumer -->|Fetch / JoinGroup / SyncGroup| Server
-    Follower -->|FetchFollower| Server
+    Producer -->|Produce| Broker
+    Consumer -->|Fetch / JoinGroup / SyncGroup| Broker
+    Follower -->|FetchFollower| Broker
+    CLI["mk CLI"] -->|wire protocol| Broker
+    Dashboard["Next.js Dashboard"] -->|HTTP JSON| AdminAPI
+    AdminAPI["Admin API"] -->|wire protocol| Broker
+    Prometheus -->|scrape :9308/metrics| Broker
 
     subgraph "Broker process"
-        Server --> Handler
-        Handler --> Broker
-        Handler --> Coordinator["Consumer Group\nCoordinator"]
-        Broker --> Router["FNV-1a Router"]
-        Broker --> MetaDB["bbolt meta.db"]
-        Broker --> Topic --> Partition
-        Partition --> Log["Segment files\n(.log + .index)"]
-        Partition --> ISR["ISR Tracker\n(leader only)"]
-        Partition --> Fetcher["Follower Fetcher\n(follower only)"]
-        Coordinator --> OffsetStore["__consumer_offsets\n(append-only log)"]
+        Broker --> Handler
+        Handler --> BrokerCore["Broker Core"]
+        Handler --> Coordinator["Consumer Group Coordinator"]
+        BrokerCore --> Router["FNV-1a Router"]
+        BrokerCore --> MetaDB["bbolt meta.db"]
+        BrokerCore --> Topic --> Partition
+        Partition --> Log["Segment files"]
+        Partition --> ISR["ISR Tracker (leader)"]
+        Partition --> Fetcher["FollowerFetcher (follower)"]
+        Coordinator --> OffsetStore["__consumer_offsets log"]
     end
 ```
 
 ### On-disk layout
-
 ```
 <data-dir>/
-├── meta.db                          # bbolt: topic configs
-├── __consumer_offsets/              # durable committed offsets
-│   ├── 00000000000000000000.log
-│   └── 00000000000000000000.index
-├── orders-0/                        # topic "orders", partition 0
+├── meta.db                      # bbolt: topic configs
+├── __consumer_offsets/          # committed offset log
+├── orders-0/                    # topic "orders", partition 0
 │   ├── 00000000000000000000.log
 │   ├── 00000000000000000000.index
-│   └── 00000000000000001024.log     # rolled at 1 MB
+│   └── 00000000000000001024.log # rolled at 1 MB
 └── orders-1/
     └── ...
 ```
@@ -133,44 +175,49 @@ graph LR
 git clone https://github.com/Utkarsh272/mini-kafka
 cd mini-kafka
 
-# Build
+# Install prometheus client dep
+go get github.com/prometheus/client_golang@latest
+
+# Build everything (broker + mk CLI + admin server)
 make build
 
-# Run single-broker smoke test (no Docker needed)
+# Single-broker smoke test — no Docker needed
 make demo
 
-# Run all tests
-make test
+# Throughput benchmark
+make bench
 
-# Run with race detector
+# All tests with race detector
 make test-race
 ```
 
-### Single broker (manual)
+### Run manually (3 terminals)
 
+**Terminal 1 — broker:**
 ```bash
-./bin/broker --addr=:9092 --data-dir=/tmp/mini-kafka --node-id=1 --host=localhost
+./bin/broker --addr=:9092 --data-dir=/tmp/mk --node-id=1 --host=localhost --port=9092
+# Metrics available at: http://localhost:9308/metrics
 ```
 
-### Throughput benchmark
-
+**Terminal 2 — admin API:**
 ```bash
-# Start a broker first, then:
-make bench
-# Reports msg/sec and MB/sec for 100K messages
+./bin/admin --broker=localhost:9092 --addr=:8080
 ```
 
----
-
-## Cluster
-
-### Start a 3-broker cluster
-
+**Terminal 3 — dashboard:**
 ```bash
-make up
+cd web && npm run dev
+# Dashboard at: http://localhost:3000
 ```
 
-This builds the Docker image and starts:
+### 3-broker Docker Compose cluster
+
+```bash
+make up      # builds image, starts 3 brokers + Prometheus + Grafana
+make down    # stop
+make logs    # tail logs
+make clean   # stop + remove volumes
+```
 
 | Service | Address |
 |---------|---------|
@@ -179,39 +226,23 @@ This builds the Docker image and starts:
 | Broker 3 | `localhost:9094` |
 | Prometheus | `http://localhost:9090` |
 | Grafana | `http://localhost:3000` (admin/admin) |
-
-```bash
-make down    # stop cluster
-make logs    # tail logs
-make clean   # stop + remove volumes
-```
-
-### How replication works in the cluster
-
-Broker startup with `--peers=2:broker-2:9093,3:broker-3:9094`:
-
-1. Load all topics from bbolt
-2. For each partition with RF > 1, compute leader using `(partID % clusterSize) + 1`
-3. Leader partitions → attach `ISRTracker`
-4. Follower partitions → start `FollowerFetcher` pointed at leader
-
-Followers continuously fetch via `FetchFollower` (API key 8). The leader advances the high-watermark as followers report progress. Consumers only read records up to the high-watermark.
+| Metrics | `:9308/metrics` on each broker |
 
 ---
 
 ## Testing
 
-| Package | What's covered |
-|---------|---------------|
-| `internal/storage` | Record encode/decode, CRC corruption, segment append/read/reopen, log rolling, cross-segment reads, 10K record volume |
-| `internal/broker` | FNV-1a hash stability, round-robin distribution, topic CRUD, metadata persistence across restarts |
-| `internal/consumer_group` | Full Join+Sync cycles, range assignor (1/2/3 members, more members than partitions), heartbeat, leave+rebalance, offset persistence |
-| `internal/replication` | ISR high-watermark, follower lag shrink/rejoin, time-based eviction, wire encode/decode roundtrip |
-| `internal/server` | TCP integration — all 12 API keys, auto-route produce, correlation IDs |
+| Package | Coverage |
+|---------|----------|
+| `internal/storage` | Encode/decode, CRC corruption detection, segment append/read/reopen, sparse index, log rolling, cross-segment reads, 10K record volume |
+| `internal/broker` | FNV-1a hash stability, round-robin distribution, topic CRUD, bbolt metadata persistence + LEO recovery across restarts |
+| `internal/consumer_group` | Full Join+Sync cycles (1/2/3 members), range assignor, more members than partitions, heartbeat generation validation, leave+rebalance trigger, offset log persistence |
+| `internal/replication` | ISR high-watermark computation, follower lag shrink/rejoin, time-based eviction, wire encode/decode roundtrip |
+| `internal/server` | TCP integration — all 12 API keys, auto-route produce, correlation ID mirroring |
 
 ```bash
 make test        # all packages
-make test-race   # with race detector
+make test-race   # race detector
 make test-short  # skip large-volume tests
 ```
 
@@ -221,12 +252,17 @@ make test-short  # skip large-volume tests
 
 Full write-up in [DESIGN.md](DESIGN.md). Key choices:
 
-- **`WriteAt` not `O_APPEND`** — `O_APPEND` ignores `Seek()`, breaking corruption tests. Explicit position tracking is equally correct under a mutex.
-- **FNV-1a routing** — same algorithm as Kafka's `DefaultPartitioner`. Fast, stable, good distribution.
-- **Blocking JoinGroup** — goroutine parks during rebalance window. Simple, correct, and exactly what Kafka does.
-- **bbolt for metadata, log for offsets** — metadata is read-heavy and rarely written (B+ tree fits). Offsets are high-frequency appends (log fits).
-- **Static leader assignment** — `(partID % clusterSize) + 1`. Deterministic, zero coordination overhead. Documented trade-off vs KRaft.
-- **`openTopic` before `saveTopic`** — orphaned log dirs on crash are harmless; bbolt missing a record on crash would fail replay.
+**`WriteAt` not `O_APPEND`** — `O_APPEND` ignores `Seek()` at the kernel level. Explicit position tracking is equally correct under a mutex and allows tests to corrupt specific byte offsets for CRC validation testing.
+
+**FNV-1a routing** — same algorithm as Kafka's `DefaultPartitioner`. Same key always maps to same partition across all producers, preserving per-key ordering guarantees.
+
+**Blocking JoinGroup** — connection goroutine parks during the rebalance window. Simpler than async callbacks; the client is already blocked waiting. Exactly what Kafka does.
+
+**bbolt for topic metadata, log for offsets** — metadata is read-heavy and rarely written (B+ tree fits). Offsets are high-frequency sequential appends (log fits). Each structure matches its access pattern.
+
+**Static leader assignment** — `(partitionID % clusterSize) + 1`. Deterministic, zero coordination overhead, no consensus protocol needed. Documented trade-off vs KRaft in DESIGN.md.
+
+**`openTopic` before `saveTopic`** — if crash happens between the two, orphaned log directories exist but bbolt has no record (harmless on replay). The reverse would fail replay, which is harder to handle.
 
 ---
 
@@ -240,9 +276,11 @@ Full write-up in [DESIGN.md](DESIGN.md). Key choices:
 | 7–9 | Consumer groups, range assignor, durable offset store | ✅ |
 | 10–12 | ISR replication, FollowerFetcher, FetchFollower API | ✅ |
 | 13–14 | Docker Compose cluster, Makefile, smoke test, DESIGN.md | ✅ |
-| 15 | CLI: `mk produce`, `mk consume`, `mk topics`, `mk groups` | 🔲 |
-| 16–17 | Next.js + TypeScript dashboard (lag, ISR, msgs/sec) | 🔲 |
-| 18 | Prometheus metrics, Grafana dashboards, load benchmark | 🔲 |
+| 15 | CLI: produce, consume, topics, groups | ✅ |
+| 16–17 | Admin HTTP API + Next.js dashboard (Recharts) | ✅ |
+| 18 | Prometheus metrics, Grafana dashboard, benchmark | ✅ |
+
+**Complete.** All 18 days shipped.
 
 ---
 
@@ -254,9 +292,10 @@ Full write-up in [DESIGN.md](DESIGN.md). Key choices:
 | Storage | `os.File` + custom binary serialization |
 | Metadata | `go.etcd.io/bbolt` |
 | Wire protocol | Custom binary TCP |
+| Metrics | `prometheus/client_golang` |
+| Dashboard | Next.js 14 + TypeScript + Tailwind + Recharts |
 | Cluster | Docker Compose (3 brokers) |
-| Observability | Prometheus + Grafana (wired, metrics endpoint coming Day 18) |
-| Dashboard (planned) | Next.js + TypeScript + Recharts |
+| Observability | Prometheus + Grafana (auto-provisioned) |
 
 ---
 

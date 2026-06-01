@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 	"syscall"
 
 	"github.com/Utkarsh272/mini-kafka/internal/broker"
+	"github.com/Utkarsh272/mini-kafka/internal/metrics"
 	"github.com/Utkarsh272/mini-kafka/internal/server"
 )
 
@@ -21,15 +23,10 @@ func main() {
 	host := flag.String("host", "localhost", "Advertised hostname returned in Metadata responses")
 	port := flag.Int("port", 9092, "Advertised port returned in Metadata responses")
 	logLevel := flag.String("log-level", "info", "Log level: debug|info|warn|error")
-
-	// Cluster peers: comma-separated list of "nodeID:host:port" for other brokers.
-	// Used to wire follower fetchers on startup for topics with RF > 1.
-	// Example: --peers=2:broker-2:9093,3:broker-3:9094
+	metricsAddr := flag.String("metrics-addr", ":9308", "Address to expose Prometheus /metrics on")
 	peers := flag.String("peers", "", "Cluster peer list: nodeID:host:port,...")
-
 	flag.Parse()
 
-	// Configure structured logging.
 	var level slog.Level
 	switch strings.ToLower(*logLevel) {
 	case "debug":
@@ -55,13 +52,24 @@ func main() {
 	}
 	defer b.Close()
 
-	// Wire cluster peers for replication if provided.
 	if *peers != "" {
 		if err := wirePeers(b, *peers); err != nil {
 			slog.Warn("peer wiring partial failure", "err", err)
-			// Non-fatal: broker can still serve producers and consumers.
 		}
 	}
+
+	// Start Prometheus metrics endpoint.
+	go func() {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", metrics.Handler())
+		mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte("ok"))
+		})
+		slog.Info("metrics listening", "addr", *metricsAddr)
+		if err := http.ListenAndServe(*metricsAddr, mux); err != nil {
+			slog.Error("metrics server error", "err", err)
+		}
+	}()
 
 	h := server.NewHandler(b)
 	srv := server.NewServer(*addr, h)
@@ -80,7 +88,7 @@ func main() {
 		"host", *host,
 		"port", *port,
 		"data_dir", *dataDir,
-		"peers", *peers,
+		"metrics", *metricsAddr,
 	)
 
 	if err := srv.ListenAndServe(); err != nil {
@@ -89,15 +97,12 @@ func main() {
 	}
 }
 
-// peer holds the parsed address of one cluster peer.
 type peer struct {
 	nodeID int32
 	host   string
 	port   int32
 }
 
-// parsePeers parses the --peers flag into a list of peer structs.
-// Format: "nodeID:host:port,nodeID:host:port"
 func parsePeers(raw string) ([]peer, error) {
 	var peers []peer
 	for _, entry := range strings.Split(raw, ",") {
@@ -117,81 +122,48 @@ func parsePeers(raw string) ([]peer, error) {
 		if err != nil {
 			return nil, fmt.Errorf("invalid port in peer %q: %w", entry, err)
 		}
-		peers = append(peers, peer{
-			nodeID: int32(nid),
-			host:   parts[1],
-			port:   int32(p),
-		})
+		peers = append(peers, peer{nodeID: int32(nid), host: parts[1], port: int32(p)})
 	}
 	return peers, nil
 }
 
-// wirePeers sets up follower fetchers for all topics where this broker
-// is a follower (i.e. the partition's leader is a different node).
-//
-// For a portfolio-grade single-binary deployment, we use a simple static
-// leader assignment: partition i is led by node ((i % len(brokers)) + 1).
-// This is documented in DESIGN.md as a known simplification vs KRaft/ZooKeeper.
 func wirePeers(b *broker.Broker, rawPeers string) error {
 	clusterPeers, err := parsePeers(rawPeers)
 	if err != nil {
 		return fmt.Errorf("parse peers: %w", err)
 	}
 
-	// Build nodeID → addr map (includes this broker's peers only).
 	addrByNodeID := make(map[int32]string)
 	for _, p := range clusterPeers {
 		addrByNodeID[p.nodeID] = fmt.Sprintf("%s:%d", p.host, p.port)
 	}
 
-	// Total cluster size = peers + self.
 	clusterSize := int32(len(clusterPeers) + 1)
-
 	myNodeID := b.NodeID()
 
 	for _, topic := range b.ListTopics() {
 		rf := topic.ReplicationFactor()
 		if rf <= 1 {
-			continue // no replication needed
+			continue
 		}
-
 		numPartitions := int32(topic.NumPartitions())
 		for partID := int32(0); partID < numPartitions; partID++ {
-			// Static leader: node ((partID % clusterSize) + 1)
-			leaderNodeID := (partID%clusterSize + 1)
-
+			leaderNodeID := partID%clusterSize + 1
 			if leaderNodeID == myNodeID {
-				// We are the leader — attach ISR tracker.
-				// Replicas are this node + the next (rf-1) nodes in the ring.
 				replicas := make([]int32, 0, rf)
 				for i := int32(0); i < rf; i++ {
-					replica := ((partID+i)%clusterSize + 1)
-					replicas = append(replicas, replica)
+					replicas = append(replicas, (partID+i)%clusterSize+1)
 				}
 				if err := b.InitLeaderISR(topic.Name(), partID, replicas); err != nil {
-					slog.Warn("init leader ISR failed",
-						"topic", topic.Name(), "partition", partID, "err", err)
-				} else {
-					slog.Info("leader ISR initialised",
-						"topic", topic.Name(), "partition", partID,
-						"replicas", replicas)
+					slog.Warn("init leader ISR failed", "topic", topic.Name(), "partition", partID, "err", err)
 				}
 			} else {
-				// We are a follower — start fetcher pointed at the leader.
 				leaderAddr, ok := addrByNodeID[leaderNodeID]
 				if !ok {
-					slog.Warn("leader addr unknown, skipping follower fetch",
-						"topic", topic.Name(), "partition", partID,
-						"leader_node_id", leaderNodeID)
 					continue
 				}
 				if err := b.InitFollowerFetcher(topic.Name(), partID, leaderAddr); err != nil {
-					slog.Warn("init follower fetcher failed",
-						"topic", topic.Name(), "partition", partID, "err", err)
-				} else {
-					slog.Info("follower fetcher started",
-						"topic", topic.Name(), "partition", partID,
-						"leader", leaderAddr)
+					slog.Warn("init follower fetcher failed", "topic", topic.Name(), "partition", partID, "err", err)
 				}
 			}
 		}

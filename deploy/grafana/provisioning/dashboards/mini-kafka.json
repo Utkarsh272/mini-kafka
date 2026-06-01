@@ -1,0 +1,66 @@
+{
+  "title": "Mini-Kafka",
+  "uid": "mini-kafka-main",
+  "schemaVersion": 38,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1, "type": "stat", "title": "Messages Produced / sec",
+      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 4 },
+      "targets": [{ "expr": "sum(rate(mini_kafka_messages_produced_total[1m]))", "legendFormat": "msg/sec" }],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [{ "color": "green", "value": null }] }, "unit": "reqps" } }
+    },
+    {
+      "id": 2, "type": "stat", "title": "Messages Fetched / sec",
+      "gridPos": { "x": 6, "y": 0, "w": 6, "h": 4 },
+      "targets": [{ "expr": "sum(rate(mini_kafka_messages_fetched_total[1m]))", "legendFormat": "msg/sec" }],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [{ "color": "blue", "value": null }] }, "unit": "reqps" } }
+    },
+    {
+      "id": 3, "type": "stat", "title": "Active Connections",
+      "gridPos": { "x": 12, "y": 0, "w": 6, "h": 4 },
+      "targets": [{ "expr": "mini_kafka_active_connections", "legendFormat": "connections" }],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [{ "color": "purple", "value": null }] } } }
+    },
+    {
+      "id": 4, "type": "stat", "title": "Produce Throughput (bytes/sec)",
+      "gridPos": { "x": 18, "y": 0, "w": 6, "h": 4 },
+      "targets": [{ "expr": "sum(rate(mini_kafka_bytes_produced_total[1m]))", "legendFormat": "bytes/sec" }],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [{ "color": "green", "value": null }] }, "unit": "Bps" } }
+    },
+    {
+      "id": 5, "type": "timeseries", "title": "Request Rate by API Key",
+      "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
+      "targets": [{ "expr": "sum by (api_key) (rate(mini_kafka_requests_total[1m]))", "legendFormat": "{{api_key}}" }],
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "lineWidth": 2 } } },
+      "options": { "legend": { "displayMode": "list" } }
+    },
+    {
+      "id": 6, "type": "timeseries", "title": "Request Latency p50 / p95 / p99 (ms)",
+      "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum by (le) (rate(mini_kafka_request_duration_ms_bucket[1m])))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.95, sum by (le) (rate(mini_kafka_request_duration_ms_bucket[1m])))", "legendFormat": "p95" },
+        { "expr": "histogram_quantile(0.99, sum by (le) (rate(mini_kafka_request_duration_ms_bucket[1m])))", "legendFormat": "p99" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms", "custom": { "lineWidth": 2 } } }
+    },
+    {
+      "id": 7, "type": "timeseries", "title": "Partition Log End Offset",
+      "gridPos": { "x": 0, "y": 12, "w": 12, "h": 8 },
+      "targets": [{ "expr": "mini_kafka_partition_log_end_offset", "legendFormat": "{{topic}}[{{partition}}]" }],
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "lineWidth": 2 } } }
+    },
+    {
+      "id": 8, "type": "timeseries", "title": "Replication Lag (records)",
+      "gridPos": { "x": 12, "y": 12, "w": 12, "h": 8 },
+      "targets": [{ "expr": "mini_kafka_partition_replication_lag", "legendFormat": "{{topic}}[{{partition}}]" }],
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "lineWidth": 2 }, "color": { "fixedColor": "yellow" } } }
+    }
+  ]
+}
