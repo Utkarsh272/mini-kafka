@@ -3,6 +3,7 @@
 
 BROKER      := bin/broker
 MK          := bin/mk
+ADMIN       := bin/admin
 IMAGE       := mini-kafka:latest
 GO_FLAGS    := -ldflags="-s -w"
 TEST_FLAGS  := -count=1 -timeout=120s
@@ -10,10 +11,11 @@ TEST_FLAGS  := -count=1 -timeout=120s
 # ── Build ─────────────────────────────────────────────────────────────────────
 
 build:
-	@echo "==> Building broker and mk CLI"
+	@echo "==> Building broker, mk CLI, and admin server"
 	@mkdir -p bin
 	go build $(GO_FLAGS) -o $(BROKER) ./cmd/broker
 	go build $(GO_FLAGS) -o $(MK) ./cmd/mk
+	go build $(GO_FLAGS) -o $(ADMIN) ./cmd/admin
 
 # ── Test ──────────────────────────────────────────────────────────────────────
 
@@ -54,8 +56,6 @@ up: docker-build
 	@echo "  Broker 3:   localhost:9094"
 	@echo "  Prometheus: http://localhost:9090"
 	@echo "  Grafana:    http://localhost:3000  (admin/admin)"
-	@echo ""
-	@echo "  Try: ./bin/mk --broker localhost:9092 topics list"
 
 down:
 	@echo "==> Stopping cluster"
@@ -71,7 +71,6 @@ clean:
 
 # ── Demo ──────────────────────────────────────────────────────────────────────
 
-# demo: spins up a local single-broker and runs the smoke test. No Docker needed.
 demo: build
 	@echo "==> Starting single-broker demo on :9092"
 	@rm -rf /tmp/mini-kafka-demo
@@ -85,10 +84,20 @@ demo: build
 	kill $$BROKER_PID 2>/dev/null; \
 	rm -rf /tmp/mini-kafka-demo
 
-# bench: throughput benchmark against a running broker.
 bench: build
 	@echo "==> Running throughput benchmark against localhost:9092"
 	go run ./scripts/bench/main.go --addr=localhost:9092 --messages=100000 --batch=100
+
+# ── Dashboard dev ─────────────────────────────────────────────────────────────
+
+# dev: start broker + admin API + Next.js dashboard in parallel
+dev: build
+	@echo "==> Starting broker on :9092, admin API on :8080, dashboard on :3000"
+	@rm -rf /tmp/mini-kafka-dev
+	@$(BROKER) --addr=:9092 --data-dir=/tmp/mini-kafka-dev --node-id=1 --host=localhost --port=9092 &
+	@sleep 0.5
+	@$(ADMIN) --broker=localhost:9092 --addr=:8080 &
+	@cd web && npm run dev
 
 # ── Help ──────────────────────────────────────────────────────────────────────
 
@@ -96,7 +105,7 @@ help:
 	@echo ""
 	@echo "mini-kafka Makefile targets:"
 	@echo ""
-	@echo "  build          Build broker (bin/broker) and CLI (bin/mk)"
+	@echo "  build          Build broker, mk CLI, and admin server"
 	@echo "  test           Run all tests"
 	@echo "  test-race      Run tests with race detector"
 	@echo "  test-short     Run short tests only"
@@ -108,11 +117,12 @@ help:
 	@echo "  clean          Remove build artifacts and Docker volumes"
 	@echo "  demo           Start single-broker and run smoke test (no Docker)"
 	@echo "  bench          Throughput benchmark against localhost:9092"
+	@echo "  dev            Start broker + admin API + Next.js dashboard"
 	@echo ""
 	@echo "CLI usage (after 'make build'):"
 	@echo "  ./bin/mk topics list"
-	@echo "  ./bin/mk topics create orders --partitions 3"
-	@echo "  ./bin/mk produce orders --key k1 --value 'hello'"
-	@echo "  ./bin/mk consume orders --from-beginning"
+	@echo "  ./bin/mk topics create --partitions 3 orders"
+	@echo "  ./bin/mk produce --key k1 --value 'hello' orders"
+	@echo "  ./bin/mk consume --from-beginning orders"
 	@echo "  ./bin/mk groups describe my-group"
 	@echo ""
